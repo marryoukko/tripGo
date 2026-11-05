@@ -1,75 +1,98 @@
-package config
+package main
 
 import (
-	"fmt"
-	"os"
-	"strconv"
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"tripgo.local/internal/config"
+	api "tripgo.local/internal/generated"
+	"tripgo.local/internal/handler"
+	"tripgo.local/internal/repository"
+	"tripgo.local/internal/service"
+	"tripgo.local/internal/transaction"
 )
 
-type Config struct {
-	HTTPAddr        string
-	DatabaseURL     string
-	LogLevel        string
-	ShutdownTimeout time.Duration
-
-	DBMaxConns        int32
-	DBMinConns        int32
-	DBConnectTimeout  time.Duration
-	DBQueryTimeout    time.Duration
-	DBMaxConnLifetime time.Duration
-}
-
-func Load() (*Config, error) {
-	cfg := &Config{
-		HTTPAddr:        os.Getenv("HTTP_ADDR"),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		LogLevel:        getEnv("LOG_LEVEL", "info"),
-		ShutdownTimeout: getDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
-
-		DBMaxConns:        int32(getInt("DATABASE_MAX_CONNS", 10)),
-		DBMinConns:        int32(getInt("DATABASE_MIN_CONNS", 2)),
-		DBConnectTimeout:  getDuration("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
-		DBQueryTimeout:    getDuration("DATABASE_QUERY_TIMEOUT", 3*time.Second),
-		DBMaxConnLifetime: getDuration("DATABASE_MAX_CONN_LIFETIME", 30*time.Minute),
-	}
-
-	if cfg.HTTPAddr == "" {
-		return nil, fmt.Errorf("HTTP_ADDR is required")
-	}
-	if cfg.DatabaseURL == "" {
-		return nil, fmt.Errorf("DATABASE_URL is required")
-	}
-	return cfg, nil
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func getInt(key string, fallback int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(v)
+func main() {
+	// 1. Конфигурация из env
+	cfg, err := config.Load()
 	if err != nil {
-		return fallback
+		log.Fatalf("config: %v", err)
 	}
-	return n
+
+	// 2. Пул соединений pgxpool
+	pool, err := newPool(cfg)
+	if err != nil {
+		log.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	// 3. Проверка доступности БД — без неё не стартуем
+	pingCtx, cancel := context.WithTimeout(context.Background(), cfg.DBConnectTimeout)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		log.Fatalf("db ping: %v", err)
+	}
+	log.Println("db connected")
+
+	// 4. Сборка зависимостей (без DI-контейнера, всё руками)
+	txManager := transaction.NewManager(pool)
+	tripRepo := repository.NewTripRepository(pool)
+	historyRepo := repository.NewHistoryRepository(pool)
+	tripSvc := service.NewTripService(tripRepo, historyRepo, txManager)
+	h := handler.New(tripSvc, pool)
+
+	// 5. Роутер: маршруты из OpenAPI + /health и /ready
+	r := chi.NewRouter()
+	api.HandlerFromMux(h, r)
+
+	// 6. HTTP-сервер с таймаутами
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           r,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// 7. Graceful shutdown по SIGINT/SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("listening on %s", cfg.HTTPAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
+	log.Println("stopped")
 }
 
-func getDuration(key string, fallback time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-	d, err := time.ParseDuration(v)
+func newPool(cfg *config.Config) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		return fallback
+		return nil, err
 	}
-	return d
+	poolCfg.MaxConns = cfg.DBMaxConns
+	poolCfg.MinConns = cfg.DBMinConns
+	poolCfg.MaxConnLifetime = cfg.DBMaxConnLifetime
+	poolCfg.ConnConfig.ConnectTimeout = cfg.DBConnectTimeout
+	return pgxpool.NewWithConfig(context.Background(), poolCfg)
 }
